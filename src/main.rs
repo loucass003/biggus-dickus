@@ -1,160 +1,126 @@
-use color_eyre::{eyre::{eyre, WrapErr}};
-use futures::FutureExt;
-use librespot::{
-    connect::spirc::Spirc,
-    core::{
-        authentication::Credentials,
-        config::{ConnectConfig, SessionConfig},
-        session::Session,
-    },
-    discovery::DeviceType,
-    playback::{
-        audio_backend,
-        config::{AudioFormat, PlayerConfig, VolumeCtrl},
-        mixer::{softmixer::SoftMixer, Mixer, MixerConfig},
-        player::{Player, PlayerEvent},
-    },
-};
-use serde::{Deserialize, Serialize};
-use serenity::{all::{Context, EventHandler, GatewayIntents, Ready}, async_trait, Client};
-use tokio::{select, try_join};
-use songbird::events::{Event, EventContext, EventHandler as VoiceEventHandler, TrackEvent};
-use songbird::SerenityInit;
+use librespot::core::mercury::MercuryError;
+use librespot::playback::player::PlayerEvent;
+use serenity::all::{ActivityData, FullEvent, OnlineStatus};
+use serenity::model::id;
+use tokio::select;
 
+mod config;
+mod discord;
+mod spotify;
 
-#[derive(Debug, Serialize, Deserialize)]
-struct BotConfig {
-    discord_token: Option<String>,
-    spotify_username: Option<String>,
-    spotify_password: Option<String>,
+struct BotState {
+    current_vc: Option<(id::GuildId, id::ChannelId)>,
 }
-
-impl ::std::default::Default for BotConfig {
-    fn default() -> Self {
-        Self {
-            discord_token: None,
-            spotify_username: None,
-            spotify_password: None,
-        }
-    }
-}
-
-
-struct Handler;
-
-#[async_trait]
-impl EventHandler for Handler {
-    async fn ready(&self, _: Context, ready: Ready) {
-        println!("{} is connected!", ready.user.name);
-    }
-}
-
 
 #[tokio::main]
 async fn main() -> color_eyre::Result<()> {
-    let config: BotConfig = confy::load("discord_bot", "config")?;
-    let file = confy::get_configuration_file_path("discord_bot", "config")?;
-    println!("The configuration file path is: {:#?}", file);
+    color_eyre::install()?;
 
-    if config.discord_token.is_none() || config.spotify_password.is_none() || config.spotify_username.is_none() {
-        return Err(eyre!("Config not set"))
-    }
+    let config = config::load_config().await?;
 
-    let token = config.discord_token.expect("Expected a token in the environment");
+    let mut spotify = spotify::Spotify::spawn(config.clone()).await;
+    let mut discord = discord::Discord::spawn(config.clone(), spotify.sink_receiver).await?;
 
-    let intents = GatewayIntents::non_privileged() | GatewayIntents::MESSAGE_CONTENT;
+    let mut state = BotState { current_vc: None };
 
-    let mut client = Client::builder(&token, intents)
-        .event_handler(Handler)
-        .register_songbird()
-        .await
-        .expect("Err creating client");
+    loop {
+        select! {
+            event = spotify.player_events.recv() => {
+                if let Some(e) = event {
+                    match e {
+                        PlayerEvent::Started {
+                            ..
+                        } => {
+                            let current_vc = discord.user_channel(config.discord_user.clone().into()).await;
+                            if let Some((guild_id, channel_id)) = current_vc {
+                                discord.join_vc(guild_id, channel_id).await;
+                                state.current_vc = current_vc;
+                            }
+                        }
 
-    tokio::spawn(async move {
-        let _ = client
-            .start()
-            .await
-            .map_err(|why| println!("Client ended: {:?}", why));
-    });
+                        PlayerEvent::Stopped {
+                            ..
+                        } => {
+                            if let Some((guild_id, _)) = state.current_vc {
+                                discord.leave_vc(guild_id).await;
+                                discord.ctx.set_presence(
+                                    None,
+                                    OnlineStatus::Online,
+                                );
+                                state.current_vc = None;
+                            }
+                        }
 
-    let session_config = SessionConfig::default();
-    let player_config = PlayerConfig::default();
-    let audio_format = AudioFormat::default();
+                        PlayerEvent::Paused { .. } => {
+                            discord.ctx.set_presence(
+                                None,
+                                OnlineStatus::Online,
+                            )
+                        }
 
-    let credentials = Credentials::with_password(config.spotify_username.unwrap(), config.spotify_password.unwrap());
-    let backend = audio_backend::find(None).unwrap();
+                        PlayerEvent::Playing { track_id, .. } => {
+                            let track: Result<librespot::metadata::Track, MercuryError> =
+                                librespot::metadata::Metadata::get(
+                                    &spotify.session,
+                                    track_id,
+                                )
+                                .await;
 
-    println!("Connecting...");
-    let (session, _creds) = Session::connect(session_config, credentials, None, false)
-        .await
-        .unwrap();
-    let cloned_session = session.clone();
+                            if let Ok(track) = track {
+                                let artist: Result<librespot::metadata::Artist, MercuryError> =
+                                    librespot::metadata::Metadata::get(
+                                        &spotify.session,
+                                        *track.artists.first().unwrap(),
+                                    )
+                                    .await;
 
-    let mixer = Box::new(SoftMixer::open(MixerConfig {
-        volume_ctrl: VolumeCtrl::Linear,
-        ..MixerConfig::default()
-    }));
-
-    let (player, mut player_events) =
-        Player::new(player_config, session, mixer.get_soft_volume(), move || {
-            backend(None, audio_format)
-        });
-
-    let config = ConnectConfig {
-        name: "Biggus Dickus".to_string(),
-        device_type: DeviceType::Speaker,
-        initial_volume: None,
-        has_volume_ctrl: true,
-        autoplay: true,
-    };
-
-    let (spirc, task) = Spirc::new(config, cloned_session, player, mixer);
-
-    let (tx, rx) = tokio::sync::oneshot::channel::<()>();
-    let rx = rx.fuse();
-
-    let spirc_task = tokio::spawn(task);
-
-    let player_events_task = tokio::spawn(async move {
-        let recv_fut = async {
-            while let Some(message) = player_events.recv().await {
-                match message {
-                    PlayerEvent::Playing {
-                        play_request_id,
-                        track_id,
-                        position_ms,
-                        duration_ms,
-                    } => {
-                        println!("PLAYING")
+                                if let Ok(artist) = artist {
+                                    discord.ctx.set_presence(
+                                        Some(ActivityData::listening(format!("{}: {}", artist.name, track.name))),
+                                        OnlineStatus::Online,
+                                    )
+                                }
+                            }
+                        }
+                        _ => {}
                     }
-                    PlayerEvent::Paused {
-                        play_request_id,
-                        track_id,
-                        position_ms,
-                        duration_ms,
-                    } => {
-                        println!("PAUSED")
-                    }
-                    _ => {}
                 }
             }
-        };
+            event = discord.event_rx.recv() => {
+                if let Some((ctx, event)) = event {
+                    async {
+                        match event {
+                            FullEvent::VoiceStateUpdate { old, new } => {
+                                if state.current_vc.is_none() {
+                                    return;
+                                }
 
-        select! {
-            _ = rx => {}
-            _ = recv_fut => {}
-        }
-        Ok(())
-    });
+                                if new.user_id != config.discord_user.clone() {
+                                    return;
+                                }
 
-    match try_join!(
-        spirc_task.map(|r| r.wrap_err("spirc task exited unexpectedly")),
-        player_events_task.map(|r| r.wrap_err("player events task exited unexpectedly")?)
-    ) {
-        Err(e) => {
-            spirc.shutdown();
-            Err(e)
+                                if old.is_none() {
+                                    discord.join_vc(new.guild_id.unwrap(), new.channel_id.unwrap()).await;
+                                    return;
+                                }
+
+                                let old_state = old.unwrap();
+
+                                if old_state.channel_id.is_some() && new.channel_id.is_none() {
+                                    discord.leave_vc(new.guild_id.unwrap()).await;
+                                    return;
+                                }
+
+                                if old_state.channel_id.unwrap() != new.channel_id.unwrap() {
+                                    discord.join_vc(new.guild_id.unwrap(), new.channel_id.unwrap()).await;
+                                    return;
+                                }
+                            }
+                            _ => {}
+                        };
+                    }.await;
+                }
+            }
         }
-        Ok(((), ())) => Ok(()),
     }
 }
